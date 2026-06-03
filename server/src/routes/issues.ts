@@ -3967,6 +3967,17 @@ export function issueRoutes(
       };
     }
     Object.assign(updateFields, transition.patch);
+
+    // NUB-4434: cuando un PATCH cambia efectivamente el `status` reseteamos el
+    // contador de attempts del watchdog `handoff_escalation` para que el
+    // siguiente ciclo de backoff parta de 0. Comentarios no resetean.
+    if (
+      typeof updateFields.status === "string" &&
+      updateFields.status !== existing.status
+    ) {
+      updateFields.monitorAttemptCount = 0;
+    }
+
     if (reviewRequest !== undefined && transition.patch.executionState === undefined) {
       const existingExecutionState = parseIssueExecutionState(existing.executionState);
       if (!existingExecutionState || existingExecutionState.status !== "pending") {

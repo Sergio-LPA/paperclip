@@ -45,6 +45,9 @@ export type {
 export {
   DEFAULT_MAX_SUCCESSFUL_RUN_HANDOFF_ATTEMPTS,
   FINISH_SUCCESSFUL_RUN_HANDOFF_REASON,
+  HANDOFF_ESCALATION_BACKOFF_DELAYS_SECONDS,
+  HANDOFF_ESCALATION_CHECKOUT_DEFER_SECONDS,
+  HANDOFF_ESCALATION_CHECKOUT_GRACE_SECONDS,
   LEGACY_SUCCESSFUL_RUN_HANDOFF_NOTICE_PREFIXES,
   SUCCESSFUL_RUN_HANDOFF_EXHAUSTED_NOTICE_BODY,
   SUCCESSFUL_RUN_HANDOFF_OPTIONS,
@@ -56,7 +59,10 @@ export {
   buildSuccessfulRunHandoffRequiredNotice,
   decideSuccessfulRunHandoff,
   findExistingFinishSuccessfulRunHandoffWake,
+  isCheckoutWithinHandoffEscalationGrace,
+  isHandoffEscalationBackoffActive,
   isSuccessfulRunHandoffRequiredNoticeBody,
+  selectHandoffEscalationBackoffSeconds,
 } from "./successful-run-handoff.js";
 export type {
   SuccessfulRunHandoffNotice,

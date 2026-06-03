@@ -7,6 +7,65 @@ import { withRecoveryModelProfileHint } from "./model-profile-hint.js";
 export const FINISH_SUCCESSFUL_RUN_HANDOFF_REASON = "finish_successful_run_handoff";
 export const SUCCESSFUL_RUN_MISSING_STATE_REASON = "successful_run_missing_state";
 export const DEFAULT_MAX_SUCCESSFUL_RUN_HANDOFF_ATTEMPTS = 1;
+
+// NUB-4434: backoff exponencial entre escalations sucesivas del watchdog
+// `successful_run_missing_state`. Antes, el watchdog reevaluaba cada ~60s y
+// disparaba otra escalation si el agente despertado no había hecho PATCH:
+// 6 escalations en 6 min (NUB-4382). Con backoff [60, 120, 300, 600, 1200, 1800]
+// el agente tiene ventanas crecientes para llegar a una disposición válida.
+export const HANDOFF_ESCALATION_BACKOFF_DELAYS_SECONDS = [
+  60,
+  120,
+  300,
+  600,
+  1200,
+  1800,
+] as const;
+
+// NUB-4434: si el agente acaba de hacer checkout (arrancando run), evita una
+// escalation por race condition durante el boot. Reprograma el siguiente check
+// pasado el grace period.
+export const HANDOFF_ESCALATION_CHECKOUT_GRACE_SECONDS = 90;
+
+// NUB-4434: delay corto que aplicamos cuando saltamos una escalation porque el
+// checkout es muy reciente. No es un backoff "real" — sólo nos da margen para
+// que el agente termine de arrancar y emita su propia disposición.
+export const HANDOFF_ESCALATION_CHECKOUT_DEFER_SECONDS = 60;
+
+export function selectHandoffEscalationBackoffSeconds(attemptCount: number): number {
+  const delays = HANDOFF_ESCALATION_BACKOFF_DELAYS_SECONDS;
+  const clamped = Math.max(0, Math.floor(attemptCount));
+  const index = Math.min(clamped, delays.length - 1);
+  return delays[index]!;
+}
+
+export function isHandoffEscalationBackoffActive(input: {
+  monitorNextCheckAt: Date | string | null | undefined;
+  now: Date;
+}): boolean {
+  if (!input.monitorNextCheckAt) return false;
+  const nextMs =
+    input.monitorNextCheckAt instanceof Date
+      ? input.monitorNextCheckAt.getTime()
+      : new Date(input.monitorNextCheckAt).getTime();
+  if (Number.isNaN(nextMs)) return false;
+  return nextMs > input.now.getTime();
+}
+
+export function isCheckoutWithinHandoffEscalationGrace(input: {
+  executionLockedAt: Date | string | null | undefined;
+  now: Date;
+}): boolean {
+  if (!input.executionLockedAt) return false;
+  const lockedMs =
+    input.executionLockedAt instanceof Date
+      ? input.executionLockedAt.getTime()
+      : new Date(input.executionLockedAt).getTime();
+  if (Number.isNaN(lockedMs)) return false;
+  const ageMs = input.now.getTime() - lockedMs;
+  if (ageMs < 0) return false;
+  return ageMs < HANDOFF_ESCALATION_CHECKOUT_GRACE_SECONDS * 1000;
+}
 export const SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY =
   "Paperclip needs a disposition before this issue can continue.";
 export const SUCCESSFUL_RUN_HANDOFF_EXHAUSTED_NOTICE_BODY =
