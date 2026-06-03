@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   FINISH_SUCCESSFUL_RUN_HANDOFF_REASON,
+  HANDOFF_ESCALATION_BACKOFF_DELAYS_SECONDS,
+  HANDOFF_ESCALATION_CHECKOUT_GRACE_SECONDS,
   SUCCESSFUL_RUN_HANDOFF_EXHAUSTED_NOTICE_BODY,
   SUCCESSFUL_RUN_HANDOFF_REQUIRED_NOTICE_BODY,
   SUCCESSFUL_RUN_MISSING_STATE_REASON,
@@ -8,9 +10,12 @@ import {
   buildSuccessfulRunHandoffExhaustedNotice,
   buildSuccessfulRunHandoffRequiredNotice,
   decideSuccessfulRunHandoff,
+  isCheckoutWithinHandoffEscalationGrace,
+  isHandoffEscalationBackoffActive,
   isIdempotentFinishSuccessfulRunHandoffWakeStatus,
   isSuccessfulRunHandoffRequiredNoticeBody,
   noticeMetadataReferencesRecoveryAction,
+  selectHandoffEscalationBackoffSeconds,
 } from "./successful-run-handoff.js";
 
 const run = {
@@ -303,5 +308,126 @@ describe("successful run handoff decision", () => {
     expect(isSuccessfulRunHandoffRequiredNoticeBody("## Successful run missing issue disposition\n\nold body")).toBe(true);
     expect(isSuccessfulRunHandoffRequiredNoticeBody("## This issue still needs a next step\n\nold body")).toBe(true);
     expect(isSuccessfulRunHandoffRequiredNoticeBody("Unrelated comment")).toBe(false);
+  });
+});
+
+describe("NUB-4434 handoff escalation backoff", () => {
+  it("uses the CTO-approved [60, 120, 300, 600, 1200, 1800] delay ladder", () => {
+    expect([...HANDOFF_ESCALATION_BACKOFF_DELAYS_SECONDS]).toEqual([60, 120, 300, 600, 1200, 1800]);
+  });
+
+  it("indexes the delay by attemptCount and caps at the last entry", () => {
+    expect(selectHandoffEscalationBackoffSeconds(0)).toBe(60);
+    expect(selectHandoffEscalationBackoffSeconds(1)).toBe(120);
+    expect(selectHandoffEscalationBackoffSeconds(2)).toBe(300);
+    expect(selectHandoffEscalationBackoffSeconds(3)).toBe(600);
+    expect(selectHandoffEscalationBackoffSeconds(4)).toBe(1200);
+    expect(selectHandoffEscalationBackoffSeconds(5)).toBe(1800);
+    // Cap: any attemptCount >= length stays at the 30-min cap.
+    expect(selectHandoffEscalationBackoffSeconds(6)).toBe(1800);
+    expect(selectHandoffEscalationBackoffSeconds(99)).toBe(1800);
+  });
+
+  it("treats negative or fractional attemptCount as the floor of the first window", () => {
+    expect(selectHandoffEscalationBackoffSeconds(-1)).toBe(60);
+    expect(selectHandoffEscalationBackoffSeconds(0.7)).toBe(60);
+    expect(selectHandoffEscalationBackoffSeconds(1.9)).toBe(120);
+  });
+
+  it("considers the backoff active while monitorNextCheckAt is in the future", () => {
+    const now = new Date("2026-06-03T10:00:00.000Z");
+    expect(
+      isHandoffEscalationBackoffActive({
+        monitorNextCheckAt: new Date("2026-06-03T10:01:00.000Z"),
+        now,
+      }),
+    ).toBe(true);
+    expect(
+      isHandoffEscalationBackoffActive({
+        monitorNextCheckAt: new Date("2026-06-03T10:00:00.000Z"),
+        now,
+      }),
+    ).toBe(false);
+    expect(
+      isHandoffEscalationBackoffActive({
+        monitorNextCheckAt: new Date("2026-06-03T09:59:00.000Z"),
+        now,
+      }),
+    ).toBe(false);
+    expect(isHandoffEscalationBackoffActive({ monitorNextCheckAt: null, now })).toBe(false);
+    expect(isHandoffEscalationBackoffActive({ monitorNextCheckAt: undefined, now })).toBe(false);
+  });
+
+  it("accepts ISO-string monitorNextCheckAt values", () => {
+    const now = new Date("2026-06-03T10:00:00.000Z");
+    expect(
+      isHandoffEscalationBackoffActive({
+        monitorNextCheckAt: "2026-06-03T10:00:30.000Z",
+        now,
+      }),
+    ).toBe(true);
+    expect(
+      isHandoffEscalationBackoffActive({
+        monitorNextCheckAt: "not a date",
+        now,
+      }),
+    ).toBe(false);
+  });
+
+  it("treats a checkout within the 90s grace as recent", () => {
+    const now = new Date("2026-06-03T10:00:00.000Z");
+    const grace = HANDOFF_ESCALATION_CHECKOUT_GRACE_SECONDS;
+    expect(
+      isCheckoutWithinHandoffEscalationGrace({
+        executionLockedAt: new Date(now.getTime() - 30 * 1000),
+        now,
+      }),
+    ).toBe(true);
+    expect(
+      isCheckoutWithinHandoffEscalationGrace({
+        executionLockedAt: new Date(now.getTime() - (grace - 1) * 1000),
+        now,
+      }),
+    ).toBe(true);
+    expect(
+      isCheckoutWithinHandoffEscalationGrace({
+        executionLockedAt: new Date(now.getTime() - grace * 1000),
+        now,
+      }),
+    ).toBe(false);
+    expect(
+      isCheckoutWithinHandoffEscalationGrace({
+        executionLockedAt: new Date(now.getTime() - (grace + 60) * 1000),
+        now,
+      }),
+    ).toBe(false);
+  });
+
+  it("ignores a future executionLockedAt (clock skew) and null values", () => {
+    const now = new Date("2026-06-03T10:00:00.000Z");
+    expect(
+      isCheckoutWithinHandoffEscalationGrace({
+        executionLockedAt: new Date(now.getTime() + 5 * 1000),
+        now,
+      }),
+    ).toBe(false);
+    expect(
+      isCheckoutWithinHandoffEscalationGrace({ executionLockedAt: null, now }),
+    ).toBe(false);
+    expect(
+      isCheckoutWithinHandoffEscalationGrace({ executionLockedAt: undefined, now }),
+    ).toBe(false);
+  });
+
+  it("documents the expected escalation cadence: 60s, 120s, 300s — ~8 min before the 3rd escalation", () => {
+    // The acceptance criterion in NUB-4434:
+    //   "1 escalation a 60s, 1 a 120s, 1 a 300s — dando al agente ~8 minutos
+    //    antes de la tercera escalation en lugar de 3 minutos antes de la cuarta."
+    const first = selectHandoffEscalationBackoffSeconds(0);
+    const second = selectHandoffEscalationBackoffSeconds(1);
+    const third = selectHandoffEscalationBackoffSeconds(2);
+    expect(first + second + third).toBe(60 + 120 + 300);
+    expect(first + second + third).toBeGreaterThanOrEqual(7 * 60);
+    expect(first + second + third).toBeLessThanOrEqual(9 * 60);
   });
 });

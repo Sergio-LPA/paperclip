@@ -40,9 +40,13 @@ import { getRunLogStore } from "../run-log-store.js";
 import {
   DEFAULT_MAX_SUCCESSFUL_RUN_HANDOFF_ATTEMPTS,
   FINISH_SUCCESSFUL_RUN_HANDOFF_REASON,
+  HANDOFF_ESCALATION_CHECKOUT_DEFER_SECONDS,
   SUCCESSFUL_RUN_MISSING_STATE_REASON,
   buildSuccessfulRunHandoffExhaustedNotice,
+  isCheckoutWithinHandoffEscalationGrace,
+  isHandoffEscalationBackoffActive,
   noticeMetadataReferencesRecoveryAction,
+  selectHandoffEscalationBackoffSeconds,
   type SuccessfulRunHandoffNotice,
 } from "./successful-run-handoff.js";
 import {
@@ -2175,6 +2179,33 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       .then((rows) => rows.map((row) => row.blockerIssueId));
   }
 
+  // NUB-4434: Persistir backoff exponencial entre escalations sucesivas del
+  // watchdog `successful_run_missing_state`. Reusa los campos
+  // `monitorAttemptCount` / `monitorNextCheckAt` de la tabla `issues`; al
+  // moverse el issue a `blocked` tras la escalation, queda fuera del filtro de
+  // `tickDueIssueMonitors` (que sólo dispatch a `in_progress|in_review`), así
+  // que no hay colisión con el scheduler de monitors agendados por agentes.
+  async function scheduleHandoffEscalationBackoff(input: {
+    issueId: string;
+    attemptCount: number;
+    overrideDelaySeconds?: number;
+    now: Date;
+  }) {
+    const delaySeconds =
+      input.overrideDelaySeconds ?? selectHandoffEscalationBackoffSeconds(input.attemptCount);
+    const nextCheckAt = new Date(input.now.getTime() + delaySeconds * 1000);
+    const nextAttemptCount = input.attemptCount + 1;
+    await db
+      .update(issues)
+      .set({
+        monitorNextCheckAt: nextCheckAt,
+        monitorAttemptCount: nextAttemptCount,
+        updatedAt: input.now,
+      })
+      .where(eq(issues.id, input.issueId));
+    return { nextCheckAt, attemptCount: nextAttemptCount, delaySeconds };
+  }
+
   async function escalateStrandedAssignedIssue(input: {
     issue: typeof issues.$inferSelect;
     previousStatus: "todo" | "in_progress";
@@ -2482,6 +2513,40 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           continue;
         }
 
+        // NUB-4434: backoff exponencial. Si la ventana de espera todavía no ha
+        // vencido, saltamos esta pasada del watchdog sin tocar el contador.
+        const now = new Date();
+        if (
+          isHandoffEscalationBackoffActive({
+            monitorNextCheckAt: issue.monitorNextCheckAt,
+            now,
+          })
+        ) {
+          result.skipped += 1;
+          continue;
+        }
+
+        // NUB-4434: guardrail anti race-condition. Si el agente acaba de hacer
+        // checkout (< 90s), su run aún puede estar arrancando — no escalamos
+        // todavía, pero sí reprogramamos un check a los CHECKOUT_DEFER segundos
+        // para no quedarnos parados si el run muere en boot.
+        if (
+          isCheckoutWithinHandoffEscalationGrace({
+            executionLockedAt: issue.executionLockedAt,
+            now,
+          })
+        ) {
+          await scheduleHandoffEscalationBackoff({
+            issueId: issue.id,
+            attemptCount: issue.monitorAttemptCount ?? 0,
+            overrideDelaySeconds: HANDOFF_ESCALATION_CHECKOUT_DEFER_SECONDS,
+            now,
+          });
+          result.skipped += 1;
+          continue;
+        }
+
+        const currentAttemptCount = issue.monitorAttemptCount ?? 0;
         const updated = await escalateStrandedAssignedIssue({
           issue,
           previousStatus: "in_progress",
@@ -2490,6 +2555,15 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           successfulRunHandoffEvidence: handoffEvidence,
         });
         if (updated) {
+          // NUB-4434: avanzamos el contador y programamos la próxima ventana.
+          // `escalateStrandedAssignedIssue` ya movió el issue a `blocked`, pero
+          // si la reabren (recovery owner / wake al asignee) el siguiente
+          // chequeo no escalará antes de la ventana.
+          await scheduleHandoffEscalationBackoff({
+            issueId: issue.id,
+            attemptCount: currentAttemptCount,
+            now,
+          });
           result.successfulRunHandoffEscalated += 1;
           result.issueIds.push(issue.id);
         } else {
