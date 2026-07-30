@@ -165,7 +165,7 @@ function canCreateAgentsLegacy(agent: { role: string; permissions: unknown }) {
 
 function canCommentAnyIssueGrant(agent: { permissions: unknown }) {
   if (!agent.permissions || typeof agent.permissions !== "object") return false;
-  return Boolean((agent.permissions as Record<string, unknown>).canCommentAnyIssue);
+  return (agent.permissions as Record<string, unknown>).canCommentAnyIssue === true;
 }
 
 function scopeValueList(value: unknown): string[] {

@@ -1227,6 +1227,10 @@ describeEmbeddedPostgres("authorization service", () => {
       permissions: { canCommentAnyIssue: true },
     });
     const plainAgent = await createAgent(db, company.id, { role: "general" });
+    const malformedAgent = await createAgent(db, company.id, {
+      role: "general",
+      permissions: { canCommentAnyIssue: "true" },
+    });
     const issue = await createIssue(db, company.id, { assigneeAgentId: ownerAgent.id });
 
     const authorization = authorizationService(db);
@@ -1258,6 +1262,12 @@ describeEmbeddedPostgres("authorization service", () => {
 
     await expect(authorization.decide({
       actor: plainActor,
+      action: "issue:comment",
+      resource,
+    })).resolves.toMatchObject({ allowed: false });
+
+    await expect(authorization.decide({
+      actor: { type: "agent", agentId: malformedAgent.id, companyId: company.id, source: "agent_key" },
       action: "issue:comment",
       resource,
     })).resolves.toMatchObject({ allowed: false });
