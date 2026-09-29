@@ -205,6 +205,13 @@ const ALL_ISSUE_STATUSES = [
   "done",
   "cancelled",
 ];
+// `done` and `cancelled` are terminal: a recovery sweep that decided to
+// escalate from an earlier snapshot must not write over them.
+export const TERMINAL_ISSUE_STATUSES = ["done", "cancelled"] as const;
+export const ESCALATABLE_ISSUE_STATUSES = ALL_ISSUE_STATUSES.filter(
+  (status) =>
+    !(TERMINAL_ISSUE_STATUSES as readonly string[]).includes(status),
+);
 const MAX_ISSUE_COMMENT_PAGE_LIMIT = 500;
 const MAX_CHAT_PRESENTATION_ATTACHMENTS = 20;
 export const ISSUE_LIST_DEFAULT_LIMIT = 500;
@@ -10564,6 +10571,7 @@ export function issueService(db: Db) {
         actorRunStopId?: string | null;
         actorUserId?: string | null;
         companyGuard?: string;
+        expectedStatuses?: string[];
       },
       dbOrTx: any = db,
       postCommitActivityPublications?: ActivityPublication[],
@@ -10611,6 +10619,7 @@ export function issueService(db: Db) {
         actorRunStopId,
         actorUserId,
         companyGuard,
+        expectedStatuses,
         ...issueData
       } = data;
       if (
@@ -10882,6 +10891,13 @@ export function issueService(db: Db) {
           .for("update")
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!receiptExisting) return null;
+        // A caller that supplies `expectedStatuses` gets its precondition
+        // enforced here, under the same row lock as the write. A check made
+        // before this call is not a boundary: the status can change between
+        // that check and this write.
+        if (expectedStatuses && !expectedStatuses.includes(receiptExisting.status)) {
+          return null;
+        }
         if (actorAgentId && actorRunId) {
           // Recheck under a run lock: a request admitted before Stop must not
           // commit a late Done after cancellation revoked its credentials.

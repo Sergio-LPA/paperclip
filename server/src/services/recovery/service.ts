@@ -99,6 +99,7 @@ import {
   readChatControlRecoveryStop,
 } from "../chat-control-recovery-stop.js";
 import {
+  ESCALATABLE_ISSUE_STATUSES,
   TERMINAL_HEARTBEAT_RUN_STATUSES,
   issueService,
   executeIssuePostCommitActions,
@@ -2737,6 +2738,7 @@ export function recoveryService(
   }) {
     const updated = await issuesSvc.update(input.issue.id, {
       status: "blocked",
+      expectedStatuses: ESCALATABLE_ISSUE_STATUSES,
     });
     if (!updated) return null;
 
@@ -3593,6 +3595,7 @@ export function recoveryService(
 
     const updated = await issuesSvc.update(input.issue.id, {
       status: "blocked",
+      expectedStatuses: ESCALATABLE_ISSUE_STATUSES,
     });
     if (!updated) return null;
     const sourceAssigneePreserved =
@@ -3950,6 +3953,7 @@ export function recoveryService(
     const updated = await issuesSvc.update(input.issue.id, {
       status: "blocked",
       blockedByIssueIds: blockerIds,
+      expectedStatuses: ESCALATABLE_ISSUE_STATUSES,
     });
     if (!updated) return null;
     if (isProviderQuotaWait) return updated;
