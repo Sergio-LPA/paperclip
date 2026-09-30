@@ -982,7 +982,7 @@ describeEmbeddedPostgres("companySkillService.list", () => {
     const skillId = randomUUID();
     const skillDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-versioned-skill-"));
     cleanupDirs.add(skillDir);
-    await fs.writeFile(path.join(skillDir, "SKILL.md"), "---\nname: Versioned Skill\ncategories:\n  - Memory\n---\n\n# Versioned Skill\n", "utf8");
+    await fs.writeFile(path.join(skillDir, "SKILL.md"), "---\nname: Versioned Skill\ncategories:\n  - memory\n---\n\n# Versioned Skill\n", "utf8");
 
     await db.insert(companies).values({
       id: companyId,
@@ -1936,6 +1936,141 @@ describeEmbeddedPostgres("companySkillService.list", () => {
     });
   });
 
+
+  it("resyncs local-path markdown, description, and store fields when SKILL.md changes on disk", async () => {
+    const companyId = randomUUID();
+    const skillId = randomUUID();
+    const skillDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-disk-wins-skill-"));
+    cleanupDirs.add(skillDir);
+    const skillFilePath = path.join(skillDir, "SKILL.md");
+    await fs.writeFile(
+      skillFilePath,
+      "---\nname: Disk Wins Skill\ndescription: First description from disk\n---\n\n# Disk Wins Skill\n",
+      "utf8",
+    );
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    // Mirrors the historical rows this repairs: the stored copy is a stub from
+    // the import, while the real instructions only ever existed on disk.
+    await db.insert(companySkills).values({
+      id: skillId,
+      companyId,
+      key: `company/${companyId}/disk-wins-skill`,
+      slug: "disk-wins-skill",
+      name: "Disk Wins Skill",
+      description: "Stale description in the column",
+      markdown: "---\nname: Disk Wins Skill\n---\n",
+      sourceType: "local_path",
+      sourceLocator: skillDir,
+      trustLevel: "markdown_only",
+      compatibility: "compatible",
+      fileInventory: [{ path: "SKILL.md", kind: "skill" }],
+      metadata: { sourceKind: "local_path" },
+    });
+
+    await svc.list(companyId);
+    const afterFirstSync = await svc.getById(companyId, skillId);
+
+    expect(afterFirstSync).toMatchObject({
+      description: "First description from disk",
+      markdown: await fs.readFile(skillFilePath, "utf8"),
+    });
+
+    const preservedUpdatedAt = new Date("2026-01-06T00:00:00.000Z");
+    await db
+      .update(companySkills)
+      .set({ updatedAt: preservedUpdatedAt })
+      .where(eq(companySkills.id, skillId));
+
+    await svc.list(companyId);
+    const afterUnchangedReconcile = await svc.getById(companyId, skillId);
+
+    // The signature recorded above short-circuits the re-read, so an unchanged
+    // file neither rewrites the stored copy nor looks like an edit.
+    expect(afterUnchangedReconcile?.updatedAt.toISOString()).toBe(preservedUpdatedAt.toISOString());
+
+    await fs.writeFile(
+      skillFilePath,
+      [
+        "---",
+        "name: Disk Wins Skill",
+        "description: Second description from disk",
+        "tagline: Edited on disk",
+        "categories:",
+        "  - Engineering",
+        "---",
+        "",
+        "# Disk Wins Skill",
+        "",
+        "Updated body.",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+
+    await svc.list(companyId);
+    const afterEdit = await svc.getById(companyId, skillId);
+
+    expect(afterEdit).toMatchObject({
+      description: "Second description from disk",
+      tagline: "Edited on disk",
+      categories: ["Engineering"],
+      markdown: await fs.readFile(skillFilePath, "utf8"),
+    });
+    expect(afterEdit?.updatedAt.toISOString()).not.toBe(preservedUpdatedAt.toISOString());
+  });
+
+  it("restores disk-owned store fields after a column-only skill update", async () => {
+    const companyId = randomUUID();
+    const skillId = randomUUID();
+    const skillDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-column-override-skill-"));
+    cleanupDirs.add(skillDir);
+    await fs.writeFile(
+      path.join(skillDir, "SKILL.md"),
+      "---\nname: Column Override Skill\ndescription: Description owned by disk\n---\n\n# Column Override Skill\n",
+      "utf8",
+    );
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(companySkills).values({
+      id: skillId,
+      companyId,
+      key: `company/${companyId}/column-override-skill`,
+      slug: "column-override-skill",
+      name: "Column Override Skill",
+      description: "Description owned by disk",
+      markdown: "---\nname: Column Override Skill\ndescription: Description owned by disk\n---\n\n# Column Override Skill\n",
+      sourceType: "local_path",
+      sourceLocator: skillDir,
+      trustLevel: "markdown_only",
+      compatibility: "compatible",
+      fileInventory: [{ path: "SKILL.md", kind: "skill" }],
+      metadata: { sourceKind: "local_path" },
+    });
+
+    await svc.list(companyId);
+    const patched = await svc.updateSkill(companyId, skillId, {
+      description: "Description typed into the library UI",
+    });
+
+    expect(patched.description).toBe("Description typed into the library UI");
+
+    await svc.list(companyId);
+    const afterReconcile = await svc.getById(companyId, skillId);
+
+    expect(afterReconcile?.description).toBe("Description owned by disk");
+  });
+
   it("imports sibling reference files when the source is a direct SKILL.md path", async () => {
     const companyId = randomUUID();
     const skillDir = await createManagedSkillDir(companyId, "file-import-skill-");
@@ -2190,7 +2325,8 @@ describeEmbeddedPostgres("companySkillService.list", () => {
     await svc.list(companyId);
     const stored = await svc.getById(companyId, skillId);
 
-    expect(stored?.metadata).toEqual({ sourceKind: "local_path" });
+    expect(stored?.metadata).toMatchObject({ sourceKind: "local_path" });
+    expect(stored?.metadata).not.toHaveProperty("missingSource");
   });
 
   it("marks source-missing company skills as unavailable during read-only runtime listing", async () => {
