@@ -2071,6 +2071,166 @@ describeEmbeddedPostgres("companySkillService.list", () => {
     expect(afterReconcile?.description).toBe("Description owned by disk");
   });
 
+  async function seedLocalPathSkill(input: { slug: string; name: string; markdown: string; description?: string | null }) {
+    const companyId = randomUUID();
+    const skillId = randomUUID();
+    const skillDir = await fs.mkdtemp(path.join(os.tmpdir(), `paperclip-${input.slug}-`));
+    cleanupDirs.add(skillDir);
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(companySkills).values({
+      id: skillId,
+      companyId,
+      key: `company/${companyId}/${input.slug}`,
+      slug: input.slug,
+      name: input.name,
+      description: input.description ?? null,
+      markdown: input.markdown,
+      sourceType: "local_path",
+      sourceLocator: skillDir,
+      trustLevel: "markdown_only",
+      compatibility: "compatible",
+      fileInventory: [{ path: "SKILL.md", kind: "skill" }],
+      metadata: { sourceKind: "local_path" },
+    });
+    return { companyId, skillId, skillFilePath: path.join(skillDir, "SKILL.md") };
+  }
+
+  it("resyncs a same-size SKILL.md rewrite that keeps the previous mtime", async () => {
+    const before = "---\nname: Same Size Skill\ndescription: Version AAAA\n---\n\n# Same Size Skill\n";
+    const after = "---\nname: Same Size Skill\ndescription: Version BBBB\n---\n\n# Same Size Skill\n";
+    expect(Buffer.byteLength(after)).toBe(Buffer.byteLength(before));
+    const { companyId, skillId, skillFilePath } = await seedLocalPathSkill({
+      slug: "same-size-skill",
+      name: "Same Size Skill",
+      markdown: before,
+      description: "Version AAAA",
+    });
+    const pinnedMtime = new Date("2026-01-05T00:00:00.000Z");
+    await fs.writeFile(skillFilePath, before, "utf8");
+    await fs.utimes(skillFilePath, pinnedMtime, pinnedMtime);
+    const originalStat = await fs.stat(skillFilePath);
+
+    await svc.list(companyId);
+    expect((await svc.getById(companyId, skillId))?.description).toBe("Version AAAA");
+
+    await fs.writeFile(skillFilePath, after, "utf8");
+    await fs.utimes(skillFilePath, pinnedMtime, pinnedMtime);
+    expect((await fs.stat(skillFilePath)).mtimeMs).toBe(originalStat.mtimeMs);
+
+    await svc.list(companyId);
+    expect(await svc.getById(companyId, skillId)).toMatchObject({
+      description: "Version BBBB",
+      markdown: after,
+    });
+  });
+
+  it("does not mirror a local-path SKILL.md larger than the catalog file limit", async () => {
+    const stored = "---\nname: Oversized Skill\ndescription: Stored description\n---\n\n# Oversized Skill\n";
+    const { companyId, skillId, skillFilePath } = await seedLocalPathSkill({
+      slug: "oversized-skill",
+      name: "Oversized Skill",
+      markdown: stored,
+      description: "Stored description",
+    });
+    await fs.writeFile(
+      skillFilePath,
+      `---\nname: Oversized Skill\ndescription: From an oversized file\n---\n\n${"x".repeat(1024 * 1024)}\n`,
+      "utf8",
+    );
+
+    await svc.list(companyId);
+    const afterReconcile = await svc.getById(companyId, skillId);
+
+    expect(afterReconcile).toMatchObject({ description: "Stored description", markdown: stored });
+    expect(afterReconcile?.metadata).not.toHaveProperty("localSourceSync");
+  });
+
+  it("advances updatedAt when the first sync only repairs stale markdown", async () => {
+    const onDisk = "---\nname: Stale Body Skill\ndescription: Same description\n---\n\n# Stale Body Skill\n\nReal instructions.\n";
+    const { companyId, skillId, skillFilePath } = await seedLocalPathSkill({
+      slug: "stale-body-skill",
+      name: "Stale Body Skill",
+      markdown: "---\nname: Stale Body Skill\n---\n",
+      description: "Same description",
+    });
+    await fs.writeFile(skillFilePath, onDisk, "utf8");
+    const preservedUpdatedAt = new Date("2026-01-06T00:00:00.000Z");
+    await db.update(companySkills).set({ updatedAt: preservedUpdatedAt }).where(eq(companySkills.id, skillId));
+
+    await svc.list(companyId);
+    const afterSync = await svc.getById(companyId, skillId);
+
+    expect(afterSync?.markdown).toBe(onDisk);
+    expect(afterSync?.updatedAt.toISOString()).not.toBe(preservedUpdatedAt.toISOString());
+  });
+
+  it("does not restore a stale sync marker when the skill is updated during a reconcile", async () => {
+    const onDisk = "---\nname: Racing Skill\ndescription: Description owned by disk\n---\n\n# Racing Skill\n";
+    const { companyId, skillId, skillFilePath } = await seedLocalPathSkill({
+      slug: "racing-skill",
+      name: "Racing Skill",
+      markdown: onDisk,
+      description: "Description owned by disk",
+    });
+    await fs.writeFile(skillFilePath, onDisk, "utf8");
+    await svc.list(companyId);
+
+    // A new file changes the inventory, so the next reconcile has a reason to
+    // write the row it read. The column update lands between that read and the
+    // write, dropping the sync marker the reconcile is still holding.
+    await fs.mkdir(path.join(path.dirname(skillFilePath), "references"), { recursive: true });
+    await fs.writeFile(path.join(path.dirname(skillFilePath), "references", "extra.md"), "# Extra\n", "utf8");
+    const originalStat = fs.stat.bind(fs);
+    let armed = true;
+    const statSpy = vi.spyOn(fs, "stat").mockImplementation((async (target: Parameters<typeof fs.stat>[0], ...rest: unknown[]) => {
+      if (armed && String(target) === skillFilePath) {
+        armed = false;
+        await db
+          .update(companySkills)
+          .set({
+            description: "Description typed into the library UI",
+            metadata: { sourceKind: "local_path" },
+            updatedAt: new Date(Date.now() + 1000),
+          })
+          .where(eq(companySkills.id, skillId));
+      }
+      return (originalStat as (...args: unknown[]) => unknown)(target, ...rest);
+    }) as typeof fs.stat);
+    try {
+      await svc.list(companyId);
+    } finally {
+      statSpy.mockRestore();
+    }
+    expect(armed).toBe(false);
+
+    await svc.list(companyId);
+    expect((await svc.getById(companyId, skillId))?.description).toBe("Description owned by disk");
+  });
+
+  it("does not bump updatedAt on the first sync when the stored copy already matches", async () => {
+    const onDisk = "---\nname: Matching Skill\ndescription: Same description\n---\n\n# Matching Skill\n";
+    const { companyId, skillId, skillFilePath } = await seedLocalPathSkill({
+      slug: "matching-skill",
+      name: "Matching Skill",
+      markdown: onDisk,
+      description: "Same description",
+    });
+    await fs.writeFile(skillFilePath, onDisk, "utf8");
+    const preservedUpdatedAt = new Date("2026-01-06T00:00:00.000Z");
+    await db.update(companySkills).set({ updatedAt: preservedUpdatedAt }).where(eq(companySkills.id, skillId));
+
+    await svc.list(companyId);
+    const afterSync = await svc.getById(companyId, skillId);
+
+    expect(afterSync?.metadata).toHaveProperty("localSourceSync");
+    expect(afterSync?.updatedAt.toISOString()).toBe(preservedUpdatedAt.toISOString());
+  });
+
   it("imports sibling reference files when the source is a direct SKILL.md path", async () => {
     const companyId = randomUUID();
     const skillDir = await createManagedSkillDir(companyId, "file-import-skill-");

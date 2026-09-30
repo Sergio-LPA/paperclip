@@ -1894,7 +1894,10 @@ function readSkillStoreMetadata(frontmatter: Record<string, unknown>, metadata: 
 // apart without reading it again on every list().
 const LOCAL_SOURCE_SYNC_METADATA_KEY = "localSourceSync";
 
-type LocalSkillFileSignature = { mtimeMs: number; sizeBytes: number };
+// `ctimeMs` and `ino` are part of the signature because `mtime` alone can be
+// carried over (`utimes`, `rsync -a`, `cp -p`): a same-size rewrite that keeps
+// the old `mtime` still moves `ctime`, and an atomic replace changes the inode.
+type LocalSkillFileSignature = { mtimeMs: number; ctimeMs: number; ino: number; sizeBytes: number };
 
 type LocalSourceSyncMarker = LocalSkillFileSignature & { sha256: string | null };
 
@@ -1904,9 +1907,19 @@ function readLocalSourceSyncMarker(
   if (!isPlainRecord(metadata)) return null;
   const marker = metadata[LOCAL_SOURCE_SYNC_METADATA_KEY];
   if (!isPlainRecord(marker)) return null;
-  const { skillFileMtimeMs: mtimeMs, skillFileSizeBytes: sizeBytes } = marker;
-  if (typeof mtimeMs !== "number" || typeof sizeBytes !== "number") return null;
-  return { mtimeMs, sizeBytes, sha256: asString(marker.skillFileSha256) };
+  const {
+    skillFileMtimeMs: mtimeMs,
+    skillFileCtimeMs: ctimeMs,
+    skillFileIno: ino,
+    skillFileSizeBytes: sizeBytes,
+  } = marker;
+  if (
+    typeof mtimeMs !== "number"
+    || typeof ctimeMs !== "number"
+    || typeof ino !== "number"
+    || typeof sizeBytes !== "number"
+  ) return null;
+  return { mtimeMs, ctimeMs, ino, sizeBytes, sha256: asString(marker.skillFileSha256) };
 }
 
 function withLocalSourceSyncMarker(
@@ -1917,6 +1930,8 @@ function withLocalSourceSyncMarker(
     ...(isPlainRecord(metadata) ? metadata : {}),
     [LOCAL_SOURCE_SYNC_METADATA_KEY]: {
       skillFileMtimeMs: marker.mtimeMs,
+      skillFileCtimeMs: marker.ctimeMs,
+      skillFileIno: marker.ino,
       skillFileSizeBytes: marker.sizeBytes,
       skillFileSha256: marker.sha256,
       syncedAt: new Date().toISOString(),
@@ -1945,7 +1960,14 @@ function localSkillFileSignaturesEqual(
   left: LocalSkillFileSignature | null,
   right: LocalSkillFileSignature | null,
 ) {
-  return Boolean(left && right && left.mtimeMs === right.mtimeMs && left.sizeBytes === right.sizeBytes);
+  return Boolean(
+    left
+    && right
+    && left.mtimeMs === right.mtimeMs
+    && left.ctimeMs === right.ctimeMs
+    && left.ino === right.ino
+    && left.sizeBytes === right.sizeBytes,
+  );
 }
 
 // Store fields `readSkillStoreMetadata` derives from the SKILL.md frontmatter.
@@ -3202,8 +3224,10 @@ export function companySkillService(db: Db) {
    * falls back to the existing row.
    *
    * Every read reaches this through `ensureSkillInventoryCurrent`, so the file
-   * is only re-read when its `mtime`/size differ from the signature recorded at
-   * the last sync: an unchanged file costs one `stat` and no write. `markdown`
+   * is only re-read when its `stat` signature differs from the one recorded at
+   * the last sync: an unchanged file costs one `stat` and no write. A file over
+   * `MAX_CATALOG_FILE_BYTES` is not mirrored at all, so a workspace writer
+   * cannot turn ordinary reads into unbounded reads and hashing. `markdown`
    * is deliberately not part of the reconcile query -- pulling every skill's
    * instructions into a hot-path select is exactly what the signature avoids --
    * so a stored content hash, not the stored text, is what tells a real edit
@@ -3211,6 +3235,7 @@ export function companySkillService(db: Db) {
    */
   async function readLocalPathSkillSourceSync(
     skill: {
+      id: string;
       name: string;
       description: string | null;
       iconUrl: string | null;
@@ -3228,7 +3253,13 @@ export function companySkillService(db: Db) {
     const skillFilePath = path.join(skillDir, "SKILL.md");
     const skillFileStat = await statPath(skillFilePath);
     if (!skillFileStat?.isFile()) return null;
-    const signature = { mtimeMs: skillFileStat.mtimeMs, sizeBytes: skillFileStat.size };
+    if (skillFileStat.size > MAX_CATALOG_FILE_BYTES) return null;
+    const signature = {
+      mtimeMs: skillFileStat.mtimeMs,
+      ctimeMs: skillFileStat.ctimeMs,
+      ino: skillFileStat.ino,
+      sizeBytes: skillFileStat.size,
+    };
     const previous = readLocalSourceSyncMarker(metadata);
     if (localSkillFileSignaturesEqual(signature, previous)) return null;
 
@@ -3256,14 +3287,24 @@ export function companySkillService(db: Db) {
       || columns.authorName !== skill.authorName
       || columns.homepageUrl !== skill.homepageUrl
       || !stableJsonEqual(columns.categories, skill.categories);
+    // Without a recorded hash (first sync of a row), compare against the stored
+    // copy once, so repairing a stale `markdown` counts as an edit and a file
+    // that already matches does not.
+    const previousSha256 = previous?.sha256 ?? await readStoredSkillMarkdownSha256(skill.id);
     return {
       columns,
-      // Recording a signature for a file that was never hashed is bookkeeping,
-      // not an edit, so the first sync only counts as a change when it actually
-      // rewrites one of the columns the reconcile query reads back.
-      changed: previous?.sha256 ? previous.sha256 !== sha256 || metadataColumnsChanged : metadataColumnsChanged,
+      changed: previousSha256 !== sha256 || metadataColumnsChanged,
       metadata: withLocalSourceSyncMarker(metadata, { ...signature, sha256 }),
     };
+  }
+
+  async function readStoredSkillMarkdownSha256(skillId: string) {
+    const row = await db
+      .select({ markdown: companySkills.markdown })
+      .from(companySkills)
+      .where(eq(companySkills.id, skillId))
+      .then((rows) => rows[0] ?? null);
+    return row ? sha256Buffer(row.markdown) : null;
   }
 
   async function reconcileLocalPathSkillSources(companyId: string) {
@@ -3285,6 +3326,7 @@ export function companySkillService(db: Db) {
         trustLevel: companySkills.trustLevel,
         fileInventory: companySkills.fileInventory,
         metadata: companySkills.metadata,
+        updatedAt: companySkills.updatedAt,
       })
       .from(companySkills)
       .where(eq(companySkills.companyId, companyId));
@@ -3328,7 +3370,15 @@ export function companySkillService(db: Db) {
               metadata,
               ...(touched ? { updatedAt: new Date() } : {}),
             })
-            .where(eq(companySkills.id, skill.id));
+            // Every column here was derived from the row as read above. If the
+            // row changed in between (e.g. `updateSkill` dropped the sync marker),
+            // writing would restore stale values, so skip it and let the next
+            // read reconcile against the current row. `updated_at` is compared at
+            // millisecond precision because that is what the read returns.
+            .where(and(
+              eq(companySkills.id, skill.id),
+              sql`date_trunc('milliseconds', ${companySkills.updatedAt}) = ${skill.updatedAt.toISOString()}::timestamptz`,
+            ));
         }
         continue;
       }
