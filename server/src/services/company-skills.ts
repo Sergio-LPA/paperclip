@@ -1945,6 +1945,24 @@ type LocalSkillFileSignature = { mtimeMs: number; ctimeMs: number; ino: number; 
 
 type LocalSourceSyncMarker = LocalSkillFileSignature & { sha256: string | null };
 
+// Frontmatter sits at the head of SKILL.md, so a file over the per-file limit
+// still has its library fields mirrored from this many leading bytes.
+const OVERSIZED_SKILL_FILE_HEAD_BYTES = 64 * 1024;
+
+async function readFileHead(filePath: string, maxBytes: number) {
+  const handle = await fs.open(filePath, "r").catch(() => null);
+  if (!handle) return null;
+  try {
+    const buffer = Buffer.alloc(maxBytes);
+    const { bytesRead } = await handle.read(buffer, 0, maxBytes, 0);
+    return buffer.subarray(0, bytesRead).toString("utf8");
+  } catch {
+    return null;
+  } finally {
+    await handle.close().catch(() => undefined);
+  }
+}
+
 function readLocalSourceSyncMarker(
   metadata: Record<string, unknown> | null,
 ): LocalSourceSyncMarker | null {
@@ -1968,7 +1986,7 @@ function readLocalSourceSyncMarker(
 
 function withLocalSourceSyncMarker(
   metadata: Record<string, unknown> | null,
-  marker: LocalSkillFileSignature & { sha256: string },
+  marker: LocalSkillFileSignature & { sha256: string | null; oversized?: boolean },
 ) {
   return {
     ...(isPlainRecord(metadata) ? metadata : {}),
@@ -1978,6 +1996,9 @@ function withLocalSourceSyncMarker(
       skillFileIno: marker.ino,
       skillFileSizeBytes: marker.sizeBytes,
       skillFileSha256: marker.sha256,
+      // The body is not mirrored past `MAX_CATALOG_FILE_BYTES`; the flag says
+      // so on the row instead of leaving the stored copy to look current.
+      ...(marker.oversized ? { skillFileOversized: true, skillFileMaxBytes: MAX_CATALOG_FILE_BYTES } : {}),
       syncedAt: new Date().toISOString(),
     },
   };
@@ -3298,9 +3319,11 @@ export function companySkillService(db: Db, options: { actor?: AuthorizationActo
    *
    * Every read reaches this through `ensureSkillInventoryCurrent`, so the file
    * is only re-read when its `stat` signature differs from the one recorded at
-   * the last sync: an unchanged file costs one `stat` and no write. A file over
-   * `MAX_CATALOG_FILE_BYTES` is not mirrored at all, so a workspace writer
-   * cannot turn ordinary reads into unbounded reads and hashing. `markdown`
+   * the last sync: an unchanged file costs one `stat` and no write. For a file
+   * over `MAX_CATALOG_FILE_BYTES` only a bounded head is read: the frontmatter
+   * fields still follow the file, the stored `markdown` is kept, and the marker
+   * flags the row as oversized. A workspace writer therefore cannot turn
+   * ordinary reads into unbounded reads and hashing. `markdown`
    * is deliberately not part of the reconcile query -- pulling every skill's
    * instructions into a hot-path select is exactly what the signature avoids --
    * so a stored content hash, not the stored text, is what tells a real edit
@@ -3326,7 +3349,6 @@ export function companySkillService(db: Db, options: { actor?: AuthorizationActo
     const skillFilePath = path.join(skillDir, "SKILL.md");
     const skillFileStat = await statPath(skillFilePath);
     if (!skillFileStat?.isFile()) return null;
-    if (skillFileStat.size > MAX_CATALOG_FILE_BYTES) return null;
     const signature = {
       mtimeMs: skillFileStat.mtimeMs,
       ctimeMs: skillFileStat.ctimeMs,
@@ -3336,14 +3358,16 @@ export function companySkillService(db: Db, options: { actor?: AuthorizationActo
     const previous = readLocalSourceSyncMarker(metadata);
     if (localSkillFileSignaturesEqual(signature, previous)) return null;
 
-    const markdown = await fs.readFile(skillFilePath, "utf8").catch(() => null);
+    const oversized = skillFileStat.size > MAX_CATALOG_FILE_BYTES;
+    const markdown = oversized
+      ? await readFileHead(skillFilePath, OVERSIZED_SKILL_FILE_HEAD_BYTES)
+      : await fs.readFile(skillFilePath, "utf8").catch(() => null);
     if (markdown === null) return null;
     const parsed = parseFrontmatterMarkdown(markdown);
     const storeMetadata = readSkillStoreMetadata(parsed.frontmatter, metadata);
-    const columns = {
+    const frontmatterColumns = {
       name: asString(parsed.frontmatter.name) ?? skill.name,
       description: asString(parsed.frontmatter.description) ?? skill.description,
-      markdown,
       iconUrl: storeMetadata.iconUrl ?? skill.iconUrl,
       color: storeMetadata.color ?? skill.color,
       tagline: storeMetadata.tagline ?? skill.tagline,
@@ -3351,7 +3375,7 @@ export function companySkillService(db: Db, options: { actor?: AuthorizationActo
       homepageUrl: storeMetadata.homepageUrl ?? skill.homepageUrl,
       categories: storeMetadata.categories.length > 0 ? storeMetadata.categories : skill.categories,
     };
-    const sha256 = sha256Buffer(markdown);
+    const columns = oversized ? frontmatterColumns : { ...frontmatterColumns, markdown };
     const metadataColumnsChanged = columns.name !== skill.name
       || columns.description !== skill.description
       || columns.iconUrl !== skill.iconUrl
@@ -3360,6 +3384,14 @@ export function companySkillService(db: Db, options: { actor?: AuthorizationActo
       || columns.authorName !== skill.authorName
       || columns.homepageUrl !== skill.homepageUrl
       || !stableJsonEqual(columns.categories, skill.categories);
+    if (oversized) {
+      return {
+        columns,
+        changed: metadataColumnsChanged,
+        metadata: withLocalSourceSyncMarker(metadata, { ...signature, sha256: null, oversized: true }),
+      };
+    }
+    const sha256 = sha256Buffer(markdown);
     // Without a recorded hash (first sync of a row), compare against the stored
     // copy once, so repairing a stale `markdown` counts as an edit and a file
     // that already matches does not.
