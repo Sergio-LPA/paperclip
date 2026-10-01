@@ -2129,7 +2129,7 @@ describeEmbeddedPostgres("companySkillService.list", () => {
     });
   });
 
-  it("does not mirror a local-path SKILL.md larger than the catalog file limit", async () => {
+  it("mirrors only the frontmatter of a local-path SKILL.md larger than the catalog file limit", async () => {
     const stored = "---\nname: Oversized Skill\ndescription: Stored description\n---\n\n# Oversized Skill\n";
     const { companyId, skillId, skillFilePath } = await seedLocalPathSkill({
       slug: "oversized-skill",
@@ -2142,12 +2142,33 @@ describeEmbeddedPostgres("companySkillService.list", () => {
       `---\nname: Oversized Skill\ndescription: From an oversized file\n---\n\n${"x".repeat(1024 * 1024)}\n`,
       "utf8",
     );
+    const readFileSpy = vi.spyOn(fs, "readFile");
 
-    await svc.list(companyId);
+    try {
+      await svc.list(companyId);
+      // The oversized body is never read whole.
+      expect(readFileSpy.mock.calls.some(([target]) => target === skillFilePath)).toBe(false);
+    } finally {
+      readFileSpy.mockRestore();
+    }
     const afterReconcile = await svc.getById(companyId, skillId);
 
-    expect(afterReconcile).toMatchObject({ description: "Stored description", markdown: stored });
-    expect(afterReconcile?.metadata).not.toHaveProperty("localSourceSync");
+    // Library fields follow the file; the body keeps the stored copy and the
+    // row says why, instead of looking current.
+    expect(afterReconcile).toMatchObject({ description: "From an oversized file", markdown: stored });
+    expect(afterReconcile?.metadata?.localSourceSync).toMatchObject({
+      skillFileOversized: true,
+      skillFileMaxBytes: 1024 * 1024,
+      skillFileSha256: null,
+    });
+
+    // Back under the limit, the next sync mirrors the full file again.
+    const shrunk = "---\nname: Oversized Skill\ndescription: Back under the limit\n---\n\n# Oversized Skill\n\nShort again.\n";
+    await fs.writeFile(skillFilePath, shrunk, "utf8");
+    await svc.list(companyId);
+    const afterShrink = await svc.getById(companyId, skillId);
+    expect(afterShrink).toMatchObject({ description: "Back under the limit", markdown: shrunk });
+    expect(afterShrink?.metadata?.localSourceSync).not.toHaveProperty("skillFileOversized");
   });
 
   it("advances updatedAt when the first sync only repairs stale markdown", async () => {
