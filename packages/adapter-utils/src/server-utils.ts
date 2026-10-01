@@ -3822,8 +3822,11 @@ export function suggestAvailableSkillKey(
 ): string | null {
   const desiredSlug = desiredSkill.split("/").pop();
   if (!desiredSlug) return null;
+  // An entry whose source is missing cannot be mounted either, so naming it
+  // would send the operator to a key that leaves the warning in place.
   const matches = availableEntries.filter((entry) => (
     entry.key !== desiredSkill
+    && entry.sourceStatus !== "missing"
     && (entry.runtimeName === desiredSlug || entry.key.split("/").pop() === desiredSlug)
   ));
   if (matches.length !== 1) return null;

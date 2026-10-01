@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
 import { companies, companySkills, createDb, projects, projectWorkspaces } from "@paperclipai/db";
 import {
@@ -180,5 +180,67 @@ describeEmbeddedPostgres("company skill import key namespace", () => {
     const secondRows = await db.select().from(companySkills).where(eq(companySkills.sourceLocator, secondDir));
     expect(secondRows).toHaveLength(1);
     expect(secondRows[0]?.key).not.toBe(`company/${companyId}/shared-slug`);
+  }, 30_000);
+  it("gives the loser of a concurrent import its hashed key instead of failing", async () => {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Race Co",
+      issuePrefix: `R${companyId.replaceAll("-", "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    const managedRoot = path.join(paperclipHome!, "instances", "default", "skills", companyId);
+    const winnerDir = await writeSkill(path.join(managedRoot, "race-a"), "race-slug");
+    const loserDir = await writeSkill(path.join(managedRoot, "race-b"), "race-slug");
+    const companyKey = `company/${companyId}/race-slug`;
+
+    // Reproduce the interleaving deterministically: the other directory's
+    // import commits the company key after this import has read it as free
+    // and before its own insert runs.
+    const originalInsert = db.insert.bind(db);
+    let injected = false;
+    const insertSpy = vi.spyOn(db, "insert").mockImplementation(((table: typeof companySkills) => {
+      const builder = originalInsert(table);
+      if (table !== companySkills) return builder;
+      const originalValues = builder.values.bind(builder);
+      (builder as { values: unknown }).values = (values: { key?: string; sourceLocator?: string | null }) => {
+        const query = originalValues(values as never);
+        if (injected || values.key !== companyKey || values.sourceLocator !== loserDir) return query;
+        injected = true;
+        const originalThen = query.then.bind(query);
+        (query as { then: unknown }).then = (onFulfilled: never, onRejected: never) =>
+          originalInsert(companySkills).values({
+            companyId,
+            key: companyKey,
+            slug: "race-slug",
+            name: "race-slug",
+            markdown: "# race-slug\n",
+            sourceType: "local_path",
+            sourceLocator: winnerDir,
+            trustLevel: "markdown_only",
+            compatibility: "compatible",
+            fileInventory: [{ path: "SKILL.md", kind: "skill" }],
+            metadata: { sourceKind: "local_path" },
+          }).then(() => originalThen(onFulfilled, onRejected));
+        return query;
+      };
+      return builder;
+    }) as never);
+
+    try {
+      const result = await companySkillService(db).importFromSource(companyId, loserDir);
+      expect(injected).toBe(true);
+      expect(result.imported[0]?.key).toMatch(/^local\/[0-9a-f]{10}\/race-slug$/);
+      expect(result.imported[0]?.sourceLocator).toBe(loserDir);
+    } finally {
+      insertSpy.mockRestore();
+    }
+
+    const winnerRows = await db.select().from(companySkills).where(eq(companySkills.sourceLocator, winnerDir));
+    expect(winnerRows.map((row) => row.key)).toEqual([companyKey]);
+    const loserRows = await db.select().from(companySkills).where(eq(companySkills.sourceLocator, loserDir));
+    expect(loserRows).toHaveLength(1);
+    expect(loserRows[0]?.key).not.toBe(companyKey);
   }, 30_000);
 });

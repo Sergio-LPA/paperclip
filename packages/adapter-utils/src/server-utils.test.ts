@@ -439,6 +439,28 @@ describe("adapter skill snapshots", () => {
     ]);
   });
 
+  it("does not suggest a slug match whose source is missing", () => {
+    const snapshot = buildRuntimeMountedSkillSnapshot({
+      adapterType: "codex_local",
+      availableEntries: [
+        {
+          key: "local/1994fe4d0a/normativa-rag",
+          runtimeName: "normativa-rag",
+          source: "/paperclip/skills/example/normativa-rag",
+          sourceStatus: "missing",
+          missingDetail: "Skill directory is missing.",
+        },
+      ],
+      desiredSkills: ["company/example/normativa-rag"],
+      configuredDetail: "Mounted on next run.",
+    });
+
+    expect(snapshot.warnings).toContain(
+      'Desired skill "company/example/normativa-rag" is not available from the Paperclip skills directory.',
+    );
+    expect(snapshot.warnings.join("\n")).not.toContain("Did you mean");
+  });
+
   it("reports source-missing company runtime skills without orphan warnings", () => {
     const snapshot = buildRuntimeMountedSkillSnapshot({
       adapterType: "codex_local",

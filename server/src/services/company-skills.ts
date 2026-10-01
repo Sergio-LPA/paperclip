@@ -6299,22 +6299,22 @@ export function companySkillService(db: Db) {
       assertImportedSkillSourceAllowed(importedSkill);
       let candidate = importedSkill;
       let existingByKey = await getByKey(companyId, candidate.key, database);
+      const fallbackKey = claimsCompanyKeyByManagedRoot(companyId, candidate)
+        ? hashedLocalSkillKey(
+          asString(candidate.sourceLocator) ?? "",
+          normalizeSkillSlug(candidate.slug) ?? "skill",
+        )
+        : null;
       // The company key is claimed by one directory only. When another
       // directory already holds it, this import keeps the path-hashed key
       // instead of repointing that row at itself — the frontmatter slug need
       // not match the directory name, so two managed directories can collide.
       if (
         existingByKey
-        && claimsCompanyKeyByManagedRoot(companyId, candidate)
+        && fallbackKey
         && !sameSkillDirectory(existingByKey.sourceLocator, candidate.sourceLocator)
       ) {
-        candidate = {
-          ...candidate,
-          key: hashedLocalSkillKey(
-            asString(candidate.sourceLocator) ?? "",
-            normalizeSkillSlug(candidate.slug) ?? "skill",
-          ),
-        };
+        candidate = { ...candidate, key: fallbackKey };
         existingByKey = await getByKey(companyId, candidate.key, database);
       }
       // Keep one catalog row per managed directory: a legacy row still keyed
@@ -6392,11 +6392,26 @@ export function companySkillService(db: Db) {
           .where(eq(companySkills.id, existing.id))
           .returning()
           .then((rows) => rows[0] ?? null)
-        : await database
-          .insert(companySkills)
-          .values(values)
-          .returning()
-          .then((rows) => rows[0] ?? null);
+        : fallbackKey && skill.key !== fallbackKey
+          // A concurrent import of another directory can claim the company key
+          // between the read above and this insert; yield it the same way.
+          ? await database
+            .insert(companySkills)
+            .values(values)
+            .onConflictDoNothing({ target: [companySkills.companyId, companySkills.key] })
+            .returning()
+            .then((rows) => rows[0] ?? null)
+          : await database
+            .insert(companySkills)
+            .values(values)
+            .returning()
+            .then((rows) => rows[0] ?? null);
+      if (!row && !existing && fallbackKey && skill.key !== fallbackKey) {
+        // Lost the race: re-run against the row that won. Another directory
+        // sends this import to its hashed key; the same directory updates it.
+        out.push(...await upsertImportedSkills(companyId, [importedSkill], database));
+        continue;
+      }
       if (!row) throw notFound("Failed to persist company skill");
       out.push(toCompanySkill(row));
     }
