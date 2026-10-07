@@ -4371,8 +4371,19 @@ export async function ensurePaperclipSkillSymlink(
     if (await materializedSkillFingerprintMatches(target, sourceFingerprint)) {
       return "skipped";
     }
-    await fs.rm(target, { recursive: true, force: true });
-    await linkSkill(source, target);
+    // Move the stale copy aside rather than deleting it up front: if the host
+    // cannot create the link (e.g. EPERM on Windows), the old copy is put back
+    // so the skill is never left missing.
+    const staleCopy = `${target}.stale-${process.pid}-${Date.now()}`;
+    await fs.rename(target, staleCopy);
+    try {
+      await linkSkill(source, target);
+    } catch (err) {
+      await fs.rm(target, { recursive: true, force: true }).catch(() => {});
+      await fs.rename(staleCopy, target);
+      throw err;
+    }
+    await fs.rm(staleCopy, { recursive: true, force: true });
     return "repaired";
   }
 
