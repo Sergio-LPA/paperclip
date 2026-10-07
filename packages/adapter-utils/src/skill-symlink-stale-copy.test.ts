@@ -67,6 +67,37 @@ describe("ensurePaperclipSkillSymlink vs a stale materialized copy", () => {
     expect(await fs.readdir(path.dirname(target))).toEqual([path.basename(target)]);
   });
 
+  it("keeps a link that a concurrent sync created first", async () => {
+    const root = await makeRoot();
+    const { source, target } = await makeStaleCopy(root);
+    const eexist = Object.assign(new Error("EEXIST: file already exists, symlink"), {
+      code: "EEXIST",
+    });
+
+    const result = await ensurePaperclipSkillSymlink(source, target, async (linkSource, linkTarget) => {
+      await fs.symlink(linkSource, linkTarget);
+      throw eexist;
+    });
+    expect(result).toBe("skipped");
+    expect(await fs.readlink(target)).toBe(source);
+    expect(await fs.readdir(path.dirname(target))).toEqual([path.basename(target)]);
+  });
+
+  it("removes a stale copy abandoned by an interrupted repair", async () => {
+    const root = await makeRoot();
+    const source = await makeSource(root, "REAL CONTENT\n");
+    const target = path.join(root, "home", "sample-skill--0a8c11691b");
+    await fs.mkdir(path.dirname(target), { recursive: true });
+    await materializePaperclipSkillCopy(source, `${target}.paperclip-stale-123-456`);
+    const unrelated = path.join(root, "home", "sample-skill--0a8c11691b.paperclip-stale-notes");
+    await fs.mkdir(unrelated);
+
+    expect(await ensurePaperclipSkillSymlink(source, target)).toBe("created");
+    expect((await fs.readdir(path.dirname(target))).sort()).toEqual(
+      [path.basename(target), path.basename(unrelated)].sort(),
+    );
+  });
+
   it("leaves a fresh managed copy alone", async () => {
     const root = await makeRoot();
     const source = await makeSource(root, "REAL CONTENT\n");
