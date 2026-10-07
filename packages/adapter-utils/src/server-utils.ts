@@ -4349,7 +4349,31 @@ export async function ensurePaperclipSkillSymlink(
   }
 
   if (!existing.isSymbolicLink()) {
-    return "skipped";
+    // A real directory at `target` used to shadow the live skill forever. When
+    // it is a Paperclip materialized copy (sentinel present) whose recorded
+    // fingerprint no longer matches the source, that copy is stale: replace it
+    // with a symlink instead of silently serving the content it was copied
+    // with. A copy that is still fresh, and any directory that is not a
+    // Paperclip materialization, are left untouched.
+    if (!existing.isDirectory()) return "skipped";
+    const sentinelExists = await fs
+      .stat(path.join(target, MATERIALIZED_SKILL_SENTINEL))
+      .then(() => true)
+      .catch(() => false);
+    if (!sentinelExists) return "skipped";
+    const sourceRoot = path.resolve(source);
+    const sourceStat = await fs.lstat(sourceRoot).catch(() => null);
+    if (!sourceStat || !sourceStat.isDirectory()) return "skipped";
+    const sourceFingerprint = await hashSkillDirectory(sourceRoot).catch(
+      () => null,
+    );
+    if (!sourceFingerprint) return "skipped";
+    if (await materializedSkillFingerprintMatches(target, sourceFingerprint)) {
+      return "skipped";
+    }
+    await fs.rm(target, { recursive: true, force: true });
+    await linkSkill(source, target);
+    return "repaired";
   }
 
   const linkedPath = await fs.readlink(target).catch(() => null);
