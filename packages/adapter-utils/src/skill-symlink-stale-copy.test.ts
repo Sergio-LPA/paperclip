@@ -98,6 +98,25 @@ describe("ensurePaperclipSkillSymlink vs a stale materialized copy", () => {
     );
   });
 
+  it("puts an abandoned copy back when the replacement link fails", async () => {
+    const root = await makeRoot();
+    const source = await makeSource(root, "REAL CONTENT\n");
+    const target = path.join(root, "home", "sample-skill--0a8c11691b");
+    await fs.mkdir(path.dirname(target), { recursive: true });
+    await materializePaperclipSkillCopy(source, `${target}.paperclip-stale-123-456`);
+    const eperm = Object.assign(new Error("EPERM: operation not permitted, symlink"), {
+      code: "EPERM",
+    });
+
+    await expect(
+      ensurePaperclipSkillSymlink(source, target, async () => {
+        throw eperm;
+      }),
+    ).rejects.toBe(eperm);
+    expect((await fs.lstat(target)).isDirectory()).toBe(true);
+    expect(await fs.readdir(path.dirname(target))).toEqual([path.basename(target)]);
+  });
+
   it("leaves a fresh managed copy alone", async () => {
     const root = await makeRoot();
     const source = await makeSource(root, "REAL CONTENT\n");

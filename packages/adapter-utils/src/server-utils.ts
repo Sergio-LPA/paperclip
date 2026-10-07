@@ -4338,22 +4338,29 @@ const STALE_SKILL_COPY_MARKER = ".paperclip-stale-";
 
 // A stale copy is moved to `<target>.paperclip-stale-<pid>-<ts>` while its
 // replacement link is created. If the process stops before that copy is
-// removed, it would show up as an installed skill, so drop leftovers that
-// still carry the materialization sentinel.
-async function removeAbandonedStaleSkillCopies(target: string): Promise<void> {
+// removed, it would show up as an installed skill. Leftovers are only removed
+// once `target` is a working link to the source, so no repair can still need
+// them; until then they are kept as the fallback.
+async function listStaleSkillCopies(target: string): Promise<string[]> {
   const dir = path.dirname(target);
   const prefix = `${path.basename(target)}${STALE_SKILL_COPY_MARKER}`;
   const entries = await fs.readdir(dir, { withFileTypes: true }).catch(() => []);
+  const copies: string[] = [];
   for (const entry of entries) {
     if (!entry.isDirectory() || !entry.name.startsWith(prefix)) continue;
-    const leftover = path.join(dir, entry.name);
+    const copy = path.join(dir, entry.name);
     const isMaterialized = await fs
-      .stat(path.join(leftover, MATERIALIZED_SKILL_SENTINEL))
+      .stat(path.join(copy, MATERIALIZED_SKILL_SENTINEL))
       .then(() => true)
       .catch(() => false);
-    if (isMaterialized) {
-      await fs.rm(leftover, { recursive: true, force: true }).catch(() => {});
-    }
+    if (isMaterialized) copies.push(copy);
+  }
+  return copies;
+}
+
+async function removeStaleSkillCopies(target: string): Promise<void> {
+  for (const copy of await listStaleSkillCopies(target)) {
+    await fs.rm(copy, { recursive: true, force: true }).catch(() => {});
   }
 }
 
@@ -4373,10 +4380,19 @@ export async function ensurePaperclipSkillSymlink(
     linkTarget,
   ) => fs.symlink(linkSource, linkTarget),
 ): Promise<"created" | "repaired" | "skipped"> {
-  await removeAbandonedStaleSkillCopies(target);
   const existing = await fs.lstat(target).catch(() => null);
   if (!existing) {
-    await linkSkill(source, target);
+    try {
+      await linkSkill(source, target);
+    } catch (err) {
+      // An interrupted repair may have left the previous copy aside. Put it
+      // back so the skill is not left missing.
+      const [copy] = await listStaleSkillCopies(target);
+      const occupied = await fs.lstat(target).then(() => true).catch(() => false);
+      if (copy && !occupied) await fs.rename(copy, target).catch(() => {});
+      throw err;
+    }
+    await removeStaleSkillCopies(target);
     return "created";
   }
 
@@ -4420,7 +4436,7 @@ export async function ensurePaperclipSkillSymlink(
       // A concurrent sync may have linked the target in the meantime. Keep its
       // link; restore the old copy only when nothing took its place.
       if (await isSymlinkTo(target, source)) {
-        await fs.rm(staleCopy, { recursive: true, force: true }).catch(() => {});
+        await removeStaleSkillCopies(target);
         return "skipped";
       }
       const occupied = await fs.lstat(target).then(() => true).catch(() => false);
@@ -4428,7 +4444,7 @@ export async function ensurePaperclipSkillSymlink(
       else await fs.rm(staleCopy, { recursive: true, force: true }).catch(() => {});
       throw err;
     }
-    await fs.rm(staleCopy, { recursive: true, force: true }).catch(() => {});
+    await removeStaleSkillCopies(target);
     return "repaired";
   }
 
@@ -4437,6 +4453,7 @@ export async function ensurePaperclipSkillSymlink(
 
   const resolvedLinkedPath = path.resolve(path.dirname(target), linkedPath);
   if (resolvedLinkedPath === source) {
+    await removeStaleSkillCopies(target);
     return "skipped";
   }
 
