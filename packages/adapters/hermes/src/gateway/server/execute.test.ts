@@ -786,9 +786,15 @@ describe("gateway connection failure reporting", () => {
     vi.stubGlobal("fetch", fetchMock);
     const ctx = makeCtx(config);
     ctx.onDispatch = vi.fn();
+    const before = Date.now();
     const result = await execute(ctx);
+    const after = Date.now();
+    // A delta-seconds `retry-after` is normalised to an absolute instant.
+    const retryAt = Date.parse(String(result.retryNotBefore));
+    expect(retryAt).toBeGreaterThanOrEqual(before + 7000);
+    expect(retryAt).toBeLessThanOrEqual(after + 7000);
     expect(result).toMatchObject({ exitCode: 1, signal: null, timedOut: false,
-      errorCode: `hermes_gateway_${code}`, errorFamily, retryNotBefore: "7",
+      errorCode: `hermes_gateway_${code}`, errorFamily,
       errorMeta: { status, body: { detail: "remote failure" } },
       resultJson: { connectionFailure: marker("create_run", reason) } });
     expect(result.errorMessage).toContain(`Hermes gateway HTTP ${status}`);
