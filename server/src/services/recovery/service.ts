@@ -209,10 +209,26 @@ export const STRANDED_RECENT_PROGRESS_EXEMPTION_MS = Math.max(
 // loop can waste. Without the exemption this path escalated on the second
 // productive heartbeat, which is what GGU-809 was raised to fix, so the
 // default is deliberately well clear of it rather than one step above it.
-export const STRANDED_RECENT_PROGRESS_EXEMPTION_MAX_STREAK = Math.max(
-  1,
-  Number(process.env.STRANDED_RECENT_PROGRESS_EXEMPTION_MAX_STREAK) || 8,
-);
+//
+// The value reaches a `.limit()`, so a fraction or a non-finite override would
+// break the history query rather than retune it. Normalize to a finite integer
+// and keep an explicit `0` at the advertised floor instead of silently
+// restoring the default.
+export function resolveStrandedExemptionStreakCap(
+  raw: string | undefined,
+  fallback = 8,
+) {
+  const parsed = Number(raw);
+  if (raw === undefined || raw.trim() === "" || !Number.isFinite(parsed)) {
+    return fallback;
+  }
+  return Math.max(1, Math.floor(parsed));
+}
+
+export const STRANDED_RECENT_PROGRESS_EXEMPTION_MAX_STREAK =
+  resolveStrandedExemptionStreakCap(
+    process.env.STRANDED_RECENT_PROGRESS_EXEMPTION_MAX_STREAK,
+  );
 
 type RecoveryWakeupOptions = {
   source?: "timer" | "assignment" | "on_demand" | "automation";
@@ -1954,6 +1970,37 @@ export function recoveryService(
       streak += 1;
     }
     return streak;
+  }
+
+  // Re-reads the issue immediately before a `blocked` write. The sweep's row is
+  // several queries old by the time an escalation decision is made, so a
+  // person or a fresh run can have moved the issue on since: completing it,
+  // handing it to someone else, or starting another attempt. Writing `blocked`
+  // from the stale snapshot would then clear execution links that belong to
+  // newer work. This is the same live-path re-read the spent-retry lane uses,
+  // plus the status and assignee the sweep selected the issue on.
+  async function strandedEscalationStillApplies(
+    issue: typeof issues.$inferSelect,
+    expectedStatus: StrandedPreviousStatus,
+  ) {
+    const [current] = await db
+      .select({
+        status: issues.status,
+        assigneeAgentId: issues.assigneeAgentId,
+        assigneeUserId: issues.assigneeUserId,
+      })
+      .from(issues)
+      .where(and(eq(issues.companyId, issue.companyId), eq(issues.id, issue.id)))
+      .limit(1);
+    if (
+      !current ||
+      current.status !== expectedStatus ||
+      current.assigneeAgentId !== issue.assigneeAgentId ||
+      current.assigneeUserId !== issue.assigneeUserId
+    ) {
+      return false;
+    }
+    return !(await hasActiveExecutionPath(issue.companyId, issue.id, null));
   }
 
   async function enqueueStrandedIssueRecovery(input: {
@@ -5429,7 +5476,10 @@ export function recoveryService(
             : 0;
           const exemptionCapped =
             exemptionStreak >= STRANDED_RECENT_PROGRESS_EXEMPTION_MAX_STREAK;
-          if (!exempted || exemptionCapped) {
+          if (
+            (!exempted || exemptionCapped) &&
+            (await strandedEscalationStillApplies(issue, "in_progress"))
+          ) {
             const updated = await escalateStrandedAssignedIssue({
               issue,
               previousStatus: "in_progress",
@@ -5449,6 +5499,12 @@ export function recoveryService(
             } else {
               result.skipped += 1;
             }
+            continue;
+          }
+          if (!exempted || exemptionCapped) {
+            // The escalation applied, but the issue moved on while this sweep
+            // was reading. Leave it to whoever owns it now.
+            result.skipped += 1;
             continue;
           }
           result.recentProgressExempted += 1;

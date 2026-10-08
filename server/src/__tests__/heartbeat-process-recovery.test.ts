@@ -243,6 +243,7 @@ import {
 } from "../vendor/paperclip-runner/testing.js";
 import {
   recoveryService,
+  resolveStrandedExemptionStreakCap,
   STRANDED_RECENT_PROGRESS_EXEMPTION_MAX_STREAK,
 } from "../services/recovery/service.ts";
 import {
@@ -16376,6 +16377,27 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(result.recentProgressExempted).toBe(1);
     expect(result.continuationRequeued).toBe(1);
     expect(result.escalated).toBe(0);
+  });
+
+  it("normalizes the automatic-continuation cap setting to a usable integer", () => {
+    // The cap reaches a `.limit()`, so a fraction or a non-finite override must
+    // not survive, and an explicit zero must land on the floor rather than
+    // silently restore the default.
+    expect(resolveStrandedExemptionStreakCap(undefined)).toBe(8);
+    expect(resolveStrandedExemptionStreakCap("")).toBe(8);
+    expect(resolveStrandedExemptionStreakCap("   ")).toBe(8);
+    expect(resolveStrandedExemptionStreakCap("not-a-number")).toBe(8);
+    expect(resolveStrandedExemptionStreakCap("Infinity")).toBe(8);
+    expect(resolveStrandedExemptionStreakCap("0")).toBe(1);
+    expect(resolveStrandedExemptionStreakCap("-5")).toBe(1);
+    expect(resolveStrandedExemptionStreakCap("2.9")).toBe(2);
+    expect(resolveStrandedExemptionStreakCap("3")).toBe(3);
+    expect(Number.isInteger(STRANDED_RECENT_PROGRESS_EXEMPTION_MAX_STREAK)).toBe(
+      true,
+    );
+    expect(STRANDED_RECENT_PROGRESS_EXEMPTION_MAX_STREAK).toBeGreaterThanOrEqual(
+      1,
+    );
   });
 
   it("does not reconcile user-assigned work through the agent stranded-work recovery path", async () => {
