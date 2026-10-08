@@ -4034,6 +4034,55 @@ export function recoveryService(
     return scheduled ? "queued" : "skipped";
   }
 
+  // Writes `blocked` only if the issue is still in `expectedStatus` with the
+  // same assignee and no live execution path, checked while holding the row
+  // lock that the update itself takes. A run enqueue or a human edit needs the
+  // same lock, so it either lands before the check (and is seen) or after the
+  // write (and sees `blocked`).
+  async function blockStrandedIssueIfUnchanged(
+    issue: typeof issues.$inferSelect,
+    expectedStatus: StrandedPreviousStatus,
+    blockerIds: string[],
+  ) {
+    const publications: ActivityPublication[] = [];
+    const postCommitActions: IssuePostCommitAction[] = [];
+    const updated = await db.transaction(async (tx) => {
+      const [current] = await tx
+        .select({
+          status: issues.status,
+          assigneeAgentId: issues.assigneeAgentId,
+          assigneeUserId: issues.assigneeUserId,
+        })
+        .from(issues)
+        .where(
+          and(eq(issues.companyId, issue.companyId), eq(issues.id, issue.id)),
+        )
+        .for("update")
+        .limit(1);
+      if (
+        !current ||
+        current.status !== expectedStatus ||
+        current.assigneeAgentId !== issue.assigneeAgentId ||
+        current.assigneeUserId !== issue.assigneeUserId
+      )
+        return null;
+      if (await hasActiveExecutionPath(issue.companyId, issue.id, null))
+        return null;
+      return issuesSvc.update(
+        issue.id,
+        { status: "blocked", blockedByIssueIds: blockerIds },
+        tx,
+        publications,
+        postCommitActions,
+      );
+    });
+    if (updated) {
+      for (const publication of publications) publishActivity(publication);
+      await executeIssuePostCommitActions(db, postCommitActions);
+    }
+    return updated;
+  }
+
   async function escalateStrandedAssignedIssue(input: {
     issue: typeof issues.$inferSelect;
     previousStatus: StrandedPreviousStatus;
@@ -4042,6 +4091,12 @@ export function recoveryService(
     notice?: StrandedRecoveryNoticeSeed | null;
     recoveryCause?: StrandedRecoveryCause;
     successfulRunHandoffEvidence?: SuccessfulRunHandoffRecoveryEvidence | null;
+    /**
+     * Re-check, under the issue row lock that the `blocked` write takes, that
+     * the issue still has this status, the same assignee and no live
+     * execution path. The write is skipped (null) when any of them moved.
+     */
+    requireUnchangedStatus?: StrandedPreviousStatus;
   }) {
     if (isStrandedIssueRecoveryIssue(input.issue)) {
       return escalateStrandedRecoveryIssueInPlace({
@@ -4078,10 +4133,16 @@ export function recoveryService(
       input.issue.companyId,
       input.issue.id,
     );
-    const updated = await issuesSvc.update(input.issue.id, {
-      status: "blocked",
-      blockedByIssueIds: blockerIds,
-    });
+    const updated = input.requireUnchangedStatus
+      ? await blockStrandedIssueIfUnchanged(
+          input.issue,
+          input.requireUnchangedStatus,
+          blockerIds,
+        )
+      : await issuesSvc.update(input.issue.id, {
+          status: "blocked",
+          blockedByIssueIds: blockerIds,
+        });
     if (!updated) return null;
     if (isProviderQuotaWait) return updated;
     const sourceAssigneePreserved =
@@ -5484,6 +5545,7 @@ export function recoveryService(
               issue,
               previousStatus: "in_progress",
               latestRun: successfulRun,
+              requireUnchangedStatus: "in_progress",
               comment: exemptionCapped
                 ? "Paperclip automatically retried continuation for this assigned `in_progress` issue " +
                   `${exemptionStreak} time(s) in a row and it still has no live execution path. ` +

@@ -16327,6 +16327,67 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     );
   });
 
+  it("does not block a capped issue that a person completed after the sweep read it", async () => {
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "succeeded",
+      retryReason: "issue_continuation_needed",
+      runSource: "issue.productive_terminal_continuation_recovery",
+      livenessState: "advanced",
+      runtimeMode: "native",
+    });
+    await db.insert(issueComments).values({
+      companyId,
+      issueId,
+      authorAgentId: agentId,
+      body: "nothing left to do here, still waiting",
+    });
+    await seedPriorAutomaticContinuationRuns({
+      companyId,
+      agentId,
+      issueId,
+      count: STRANDED_RECENT_PROGRESS_EXEMPTION_MAX_STREAK - 1,
+    });
+    // Complete the issue at the first transaction the escalation opens. That
+    // is after the sweep's unlocked re-read and before any row lock, which is
+    // the window a person can use: the `blocked` write must notice the change
+    // under the lock instead of overwriting the person's decision.
+    const originalTransaction = db.transaction.bind(db);
+    let completed = false;
+    const transactionSpy = vi
+      .spyOn(db, "transaction")
+      .mockImplementation(async (...args: Parameters<typeof db.transaction>) => {
+        if (
+          !completed &&
+          new Error().stack?.includes("escalateStrandedAssignedIssue")
+        ) {
+          completed = true;
+          await db
+            .update(issues)
+            .set({ status: "done" })
+            .where(eq(issues.id, issueId));
+        }
+        return originalTransaction(...args);
+      });
+    try {
+      const heartbeat = heartbeatService(db);
+      const result = await heartbeat.reconcileStrandedAssignedIssues();
+      expect(completed).toBe(true);
+      expect(result.escalated).toBe(0);
+      expect(result.recentProgressExemptionCapped).toBe(0);
+      expect(result.continuationRequeued).toBe(0);
+    } finally {
+      transactionSpy.mockRestore();
+    }
+
+    const issue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("done");
+  });
+
   it("does not count an interrupted automatic-continuation streak from older history", async () => {
     const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
       status: "in_progress",
