@@ -1124,9 +1124,12 @@ export function recoveryService(
     companyId: string,
     issueId: string,
     agentId?: string | null,
+    // Pass the transaction when the caller holds one, so these reads do not
+    // wait for a second pool connection while the transaction holds the first.
+    executor: Db = db,
   ) {
     const [run, deferredWake, nativeRecovery] = await Promise.all([
-      db
+      executor
         .select({ id: heartbeatRuns.id })
         .from(heartbeatRuns)
         .where(
@@ -1141,7 +1144,7 @@ export function recoveryService(
         )
         .limit(1)
         .then((rows) => rows[0] ?? null),
-      db
+      executor
         .select({ id: agentWakeupRequests.id })
         .from(agentWakeupRequests)
         .where(
@@ -1154,7 +1157,7 @@ export function recoveryService(
         )
         .limit(1)
         .then((rows) => rows[0] ?? null),
-      db
+      executor
         .select({ id: nativeRunFinalizations.runId })
         .from(nativeRunFinalizations)
         .innerJoin(
@@ -4066,7 +4069,14 @@ export function recoveryService(
         current.assigneeUserId !== issue.assigneeUserId
       )
         return null;
-      if (await hasActiveExecutionPath(issue.companyId, issue.id, null))
+      if (
+        await hasActiveExecutionPath(
+          issue.companyId,
+          issue.id,
+          null,
+          tx as unknown as Db,
+        )
+      )
         return null;
       return issuesSvc.update(
         issue.id,
