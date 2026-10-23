@@ -412,6 +412,10 @@ type CreateVersionOptions = {
   database?: DbOrTransaction;
 };
 
+type RecordFileStateOptions = {
+  afterRecord?: (version: CompanySkillVersion, database: Db) => Promise<void>;
+};
+
 type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
 type DbOrTransaction = Db | DbTransaction;
 
@@ -3097,8 +3101,9 @@ export function companySkillService(db: Db, options: { actor?: AuthorizationActo
 
   async function collectVersionFileInventoryFromDirectory(
     skillDir: string,
+    mode: LocalSkillInventoryMode = "full",
   ): Promise<CompanySkillVersionFileInventoryEntry[]> {
-    const inventory = await collectLocalSkillInventory(skillDir);
+    const inventory = await collectLocalSkillInventory(skillDir, mode);
     return Promise.all(inventory.map(async (entry) => ({
       ...snapshotFile(entry.path, entry.kind, await fs.readFile(path.join(skillDir, entry.path)), Boolean((await fs.stat(path.join(skillDir, entry.path))).mode & 0o111)),
     })));
@@ -3476,9 +3481,14 @@ export function companySkillService(db: Db, options: { actor?: AuthorizationActo
       ?? await getByKey(companyId, ref);
   }
 
-  async function getVersion(companyId: string, skillId: string, versionId: string): Promise<CompanySkillVersion | null> {
-    if (!await getById(companyId, skillId)) return null;
-    const row = await db
+  async function getVersion(
+    companyId: string,
+    skillId: string,
+    versionId: string,
+    database: DbOrTransaction = db,
+  ): Promise<CompanySkillVersion | null> {
+    if (!await getById(companyId, skillId, database)) return null;
+    const row = await database
       .select()
       .from(companySkillVersions)
       .where(and(
@@ -4764,6 +4774,7 @@ export function companySkillService(db: Db, options: { actor?: AuthorizationActo
   async function recordFileStateOutsideVersionHistory(
     companyId: string,
     skillId: string,
+    options: RecordFileStateOptions = {},
   ): Promise<CompanySkillVersion | null> {
     return db.transaction(async (tx) => {
       await tx.execute(sql`
@@ -4775,15 +4786,27 @@ export function companySkillService(db: Db, options: { actor?: AuthorizationActo
       `);
       const skill = await getById(companyId, skillId, tx);
       if (!skill || skill.sourceType !== "local_path" || !skill.currentVersionId) return null;
-      const recorded = await getVersion(companyId, skillId, skill.currentVersionId);
+      const recorded = await getVersion(companyId, skillId, skill.currentVersionId, tx);
       if (!recorded) return null;
+      // Read the directory itself, and read it with this transaction only. Reading a
+      // file through the service instead refreshes the company's skill inventory, and
+      // that refresh writes this skill row when the file set changed on disk: it would
+      // wait for the lock held above while this transaction waits for it.
+      const skillDir = normalizeSkillDirectory(skill);
       // An unreadable directory is a transient mount problem, not an edit. Leave
       // version history alone instead of recording an empty skill over it.
-      const onDisk = await collectVersionFileInventory(companyId, skill).catch(() => null);
+      const onDisk = skillDir
+        ? await collectVersionFileInventoryFromDirectory(skillDir, inferLocalSkillInventoryMode(skill)).catch(() => null)
+        : null;
       if (!onDisk?.length || sameVersionFileInventory(recorded.fileInventory, onDisk)) return null;
-      return createVersion(companyId, skillId, { label: "Edited outside version history" }, null, {
+      const version = await createVersion(companyId, skillId, { label: "Edited outside version history" }, null, {
         database: tx, skill, fileInventory: onDisk, skipInventoryRefresh: true,
       });
+      // This version moves "currentVersionId", so it is a change of its own. Record it
+      // where the caller records its write: the write can still fail the version check
+      // after this, and that must not leave the change unlogged.
+      await options.afterRecord?.(version, tx as unknown as Db);
+      return version;
     });
   }
 
