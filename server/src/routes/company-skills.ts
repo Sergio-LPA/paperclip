@@ -1277,6 +1277,10 @@ export function companySkillRoutes(db: Db) {
       const companyId = req.params.companyId as string;
       const skillId = req.params.skillId as string;
       await assertCanMutateCompanySkills(req, companyId, "skills.edit", () => skillPolicyResource({ companyId, skillId }));
+      // Give any disk edit that bypassed this route its own version before the
+      // optimistic check reads "currentVersionId". This commits on its own, outside
+      // the write transaction below, so a conflict cannot roll it back.
+      await svc.recordFileStateOutsideVersionHistory(companyId, skillId);
       const { idempotencyKey, expectedVersionId, ...input } = req.body;
       if (idempotencyKey) {
         const actor = getActorInfo(req);
