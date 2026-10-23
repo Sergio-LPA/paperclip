@@ -2050,37 +2050,6 @@ export function recoveryService(
     return streak;
   }
 
-  // Re-reads the issue immediately before a `blocked` write. The sweep's row is
-  // several queries old by the time an escalation decision is made, so a
-  // person or a fresh run can have moved the issue on since: completing it,
-  // handing it to someone else, or starting another attempt. Writing `blocked`
-  // from the stale snapshot would then clear execution links that belong to
-  // newer work. This is the same live-path re-read the spent-retry lane uses,
-  // plus the status and assignee the sweep selected the issue on.
-  async function strandedEscalationStillApplies(
-    issue: typeof issues.$inferSelect,
-    expectedStatus: StrandedPreviousStatus,
-  ) {
-    const [current] = await db
-      .select({
-        status: issues.status,
-        assigneeAgentId: issues.assigneeAgentId,
-        assigneeUserId: issues.assigneeUserId,
-      })
-      .from(issues)
-      .where(and(eq(issues.companyId, issue.companyId), eq(issues.id, issue.id)))
-      .limit(1);
-    if (
-      !current ||
-      current.status !== expectedStatus ||
-      current.assigneeAgentId !== issue.assigneeAgentId ||
-      current.assigneeUserId !== issue.assigneeUserId
-    ) {
-      return false;
-    }
-    return !(await hasActiveExecutionPath(issue.companyId, issue.id, null));
-  }
-
   async function enqueueStrandedIssueRecovery(input: {
     issueId: string;
     agentId: string;
@@ -5648,9 +5617,12 @@ export function recoveryService(
             : 0;
           const exemptionCapped =
             exemptionStreak >= STRANDED_RECENT_PROGRESS_EXEMPTION_MAX_STREAK;
+          // The live-path re-read guards the `blocked` write against a run or
+          // wake that started after the loop's check; the escalation itself
+          // re-checks the issue row under its lock.
           if (
             (!exempted || exemptionCapped) &&
-            (await strandedEscalationStillApplies(issue, "in_progress"))
+            !(await hasActiveExecutionPath(issue.companyId, issue.id, null))
           ) {
             const updated = await escalateStrandedAssignedIssue({
               issue,
