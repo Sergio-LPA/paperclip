@@ -6234,6 +6234,8 @@ export function recoveryService(
           },
           "skipped issue-terminal terminalization: run is younger than the grace period and is most likely a fresh reassignment hand-off",
         );
+        // Deferred, not dropped: come back when the run leaves the grace period.
+        options?.onDeferredDeadline?.(startedMs + ISSUE_TERMINAL_MIN_RUN_AGE_MS);
         issueTerminalStatus = null;
       }
     }
