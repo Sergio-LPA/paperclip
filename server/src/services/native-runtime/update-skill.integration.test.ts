@@ -9,6 +9,7 @@ import { startRunnerApiTestServer } from "../../__tests__/helpers/runner-api-ser
 import { PaperclipRunnerToolAuthority } from "./paperclip-runner-tool-authority.js";
 import { companySkillPolicyService } from "../company-skill-policy.js";
 import { companySkillService } from "../company-skills.js";
+import { resolvePaperclipInstanceRoot } from "../../home-paths.js";
 
 describe("runner update_skill through the real skill API", () => {
   let server: Awaited<ReturnType<typeof startRunnerApiTestServer>>;
@@ -42,6 +43,29 @@ describe("runner update_skill through the real skill API", () => {
     return { ...result, skill, args };
   }
 
+  // createLocalSkill stores managed content with no directory (#18334). Drift outside
+  // the API only exists for a skill linked to a directory on disk, so import one.
+  async function linkedFixture() {
+    const result = await server.fixture();
+    await server.db.insert(companyMemberships).values({ companyId: result.companyId, principalType: "agent", principalId: result.agentId, status: "active", membershipRole: "member" });
+    // Local imports are only allowed from approved roots; the company's managed skills
+    // root is one, and it is where an instance keeps directories edited outside the API.
+    const root = join(resolvePaperclipInstanceRoot(), "skills", result.companyId);
+    await mkdir(root, { recursive: true });
+    const directory = await mkdtemp(join(root, "release-review-"));
+    await writeFile(join(directory, "SKILL.md"),
+      "---\nname: release-review\ndescription: Review releases.\n---\n\n# Review\nInspect the release.\n", "utf8");
+    const service = companySkillService(server.db);
+    const imported = (await service.importFromSource(result.companyId, directory)).imported[0]!;
+    // An import records no version; the first write through the API would. Record the
+    // starting state so the tests begin from a skill with one version, as an edited one has.
+    await service.createVersion(result.companyId, imported.id, {}, null);
+    const skill = (await service.getById(result.companyId, imported.id))!;
+    const args = { skillId: skill.id, expectedVersionId: skill.currentVersionId, idempotencyKey: randomUUID(),
+      markdown: "---\nname: release-review\ndescription: Review releases.\n---\n\n# Review\nInspect the release and its tests.\n" };
+    return { ...result, skill, args };
+  }
+
   it("persists exactly one version and attributed activity across retries and a replacement run", async () => {
     const testFixture = await fixture();
     const { authority, args, companyId, skill, issueId } = testFixture;
@@ -66,7 +90,7 @@ describe("runner update_skill through the real skill API", () => {
   });
 
   it("keeps an edit made outside the API and rejects the write prepared from the earlier file", async () => {
-    const { companyId, skill, args, authority } = await fixture();
+    const { companyId, skill, args, authority } = await linkedFixture();
     const service = companySkillService(server.db);
     const outOfBand = "---\nname: release-review\ndescription: Review releases.\n---\n\n# Review\nCheck the signatures first.\n";
     await writeFile(join(String(skill.sourceLocator), "SKILL.md"), outOfBand, "utf8");
@@ -95,14 +119,14 @@ describe("runner update_skill through the real skill API", () => {
   });
 
   it("adds no version when the files on disk match the current version", async () => {
-    const { companyId, skill } = await fixture();
+    const { companyId, skill } = await linkedFixture();
     const service = companySkillService(server.db);
     expect(await service.recordFileStateOutsideVersionHistory(companyId, skill.id)).toBeNull();
     expect(await service.listVersions(companyId, skill.id)).toHaveLength(1);
   });
 
   it("leaves the drift to a write that moved the version after the comparison", async () => {
-    const { companyId, skill } = await fixture();
+    const { companyId, skill } = await linkedFixture();
     const service = companySkillService(server.db);
     await writeFile(join(String(skill.sourceLocator), "SKILL.md"),
       "---\nname: release-review\ndescription: Review releases.\n---\n\n# Review\nConcurrent edit.\n", "utf8");
@@ -124,7 +148,7 @@ describe("runner update_skill through the real skill API", () => {
   });
 
   it("does not record content that a failed write rolled back before the lock", async () => {
-    const { companyId, skill } = await fixture();
+    const { companyId, skill } = await linkedFixture();
     const service = companySkillService(server.db);
     const skillFile = join(String(skill.sourceLocator), "SKILL.md");
     const original = await readFile(skillFile, "utf8");
@@ -145,7 +169,7 @@ describe("runner update_skill through the real skill API", () => {
   });
 
   it("records files added and removed on disk, then accepts a write based on that record", async () => {
-    const { companyId, skill, args, authority } = await fixture();
+    const { companyId, skill, args, authority } = await linkedFixture();
     const service = companySkillService(server.db);
     const skillDir = String(skill.sourceLocator);
     await mkdir(join(skillDir, "reference"), { recursive: true });
