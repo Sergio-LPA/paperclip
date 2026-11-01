@@ -2124,6 +2124,51 @@ describeEmbeddedPostgres("companySkillService.list", () => {
     expect(afterEdit?.updatedAt.toISOString()).not.toBe(preservedUpdatedAt.toISOString());
   });
 
+  it("resyncs store fields edited in the SKILL.md metadata block", async () => {
+    const companyId = randomUUID();
+    const skillId = randomUUID();
+    const skillDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-metadata-block-skill-"));
+    cleanupDirs.add(skillDir);
+    const skillFilePath = path.join(skillDir, "SKILL.md");
+    const write = (tagline: string, color: string) => fs.writeFile(skillFilePath, [
+      "---", "name: Metadata Block Skill", "metadata:", `  tagline: ${tagline}`, `  color: "${color}"`,
+      "  categories:", "    - Operations", "---", "", "# Metadata Block Skill", "",
+    ].join("\n"), "utf8");
+    await write("Imported tagline", "#111111");
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    // A local import spreads the frontmatter `metadata:` block into the row metadata.
+    await db.insert(companySkills).values({
+      id: skillId,
+      companyId,
+      key: `company/${companyId}/metadata-block-skill`,
+      slug: "metadata-block-skill",
+      name: "Metadata Block Skill",
+      markdown: await fs.readFile(skillFilePath, "utf8"),
+      tagline: "Imported tagline",
+      color: "#111111",
+      categories: ["Operations"],
+      sourceType: "local_path",
+      sourceLocator: skillDir,
+      trustLevel: "markdown_only",
+      compatibility: "compatible",
+      fileInventory: [{ path: "SKILL.md", kind: "skill" }],
+      metadata: { sourceKind: "local_path", tagline: "Imported tagline", color: "#111111", categories: ["Operations"] },
+    });
+    await svc.list(companyId);
+
+    await write("Edited in the metadata block", "#222222");
+    await svc.list(companyId);
+    const afterEdit = await svc.getById(companyId, skillId);
+
+    expect(afterEdit).toMatchObject({ tagline: "Edited in the metadata block", color: "#222222", categories: ["Operations"] });
+    expect(afterEdit?.metadata).toMatchObject({ sourceKind: "local_path", tagline: "Edited in the metadata block", color: "#222222" });
+  });
+
   it("restores disk-owned store fields after a column-only skill update", async () => {
     const companyId = randomUUID();
     const skillId = randomUUID();

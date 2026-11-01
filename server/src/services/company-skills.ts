@@ -1915,6 +1915,22 @@ function readStringList(value: unknown): string[] {
     : [];
 }
 
+const SKILL_STORE_METADATA_KEYS = ["iconUrl", "icon", "color", "tagline", "authorName", "homepageUrl", "categories", "tags"] as const;
+
+// Overlay the store fields of a SKILL.md `metadata:` block onto stored row metadata.
+// Only store fields: keys such as `skillKey` or `sourceKind` keep their stored value.
+function withFileStoreMetadata(
+  metadata: Record<string, unknown> | null,
+  frontmatter: Record<string, unknown>,
+): Record<string, unknown> | null {
+  const fileMetadata = isPlainRecord(frontmatter.metadata) ? frontmatter.metadata : null;
+  if (!fileMetadata) return metadata;
+  const store = Object.fromEntries(SKILL_STORE_METADATA_KEYS
+    .filter((key) => fileMetadata[key] !== undefined)
+    .map((key) => [key, fileMetadata[key]]));
+  return Object.keys(store).length > 0 ? { ...(metadata ?? {}), ...store } : metadata;
+}
+
 function readSkillStoreMetadata(frontmatter: Record<string, unknown>, metadata: Record<string, unknown> | null) {
   const categories = normalizeCategoryList([
     ...readStringList(frontmatter.categories),
@@ -3364,6 +3380,10 @@ export function companySkillService(db: Db, options: { actor?: AuthorizationActo
       : await fs.readFile(skillFilePath, "utf8").catch(() => null);
     if (markdown === null) return null;
     const parsed = parseFrontmatterMarkdown(markdown);
+    // A local import copies the frontmatter `metadata:` block into the row, and the
+    // store fields are read from there too. Take that block from the file as it is
+    // now, so an edit to e.g. `metadata.tagline` reaches the library row.
+    metadata = withFileStoreMetadata(metadata, parsed.frontmatter);
     const storeMetadata = readSkillStoreMetadata(parsed.frontmatter, metadata);
     const frontmatterColumns = {
       name: asString(parsed.frontmatter.name) ?? skill.name,
